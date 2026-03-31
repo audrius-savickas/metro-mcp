@@ -28,6 +28,9 @@ const logger = createLogger('metro-config');
 const PROXY_PORT_ENV = 'METRO_MCP_PROXY_PORT';
 const PROXY_PORT_FILE = '.metro-mcp-proxy-port';
 
+// Sentinel property to prevent double-wrapping getPageDescriptions.
+const MCP_PATCHED = Symbol.for('metro-mcp-patched');
+
 // Cache the port after the first successful discovery — it's invariant once
 // the MCP server writes it. Never cache null: the MCP server may start after
 // Metro, so we keep retrying until we find a valid port.
@@ -82,6 +85,30 @@ function rewritePageDescription(
   return rewritten;
 }
 
+/**
+ * Wrap a target object's `getPageDescriptions` method to rewrite CDP URLs.
+ * Works on both prototypes and individual instances. Idempotent (uses a
+ * Symbol sentinel to skip if already wrapped).
+ */
+function wrapGetPageDescriptions(target: Record<string | symbol, unknown>): boolean {
+  if (target[MCP_PATCHED]) return false;
+
+  const original = target.getPageDescriptions;
+  if (typeof original !== 'function') return false;
+
+  target.getPageDescriptions = function (
+    this: unknown,
+    ...args: unknown[]
+  ): Record<string, unknown>[] {
+    const pages = (original as Function).apply(this, args) as Record<string, unknown>[];
+    const proxyPort = discoverProxyPort();
+    if (!proxyPort) return pages;
+    return pages.map((page) => rewritePageDescription(page, proxyPort));
+  };
+  target[MCP_PATCHED] = true;
+  return true;
+}
+
 let patched = false;
 
 function patchDevMiddleware(): void {
@@ -89,55 +116,111 @@ function patchDevMiddleware(): void {
   patched = true;
 
   try {
-    // Resolve from the user's project root so we find the copy of
-    // @react-native/dev-middleware that Metro is actually using.
     const req = createRequire(process.cwd() + '/');
 
-    let devMiddlewarePath: string;
+    // Verify @react-native/dev-middleware is installed.
     try {
-      devMiddlewarePath = req.resolve('@react-native/dev-middleware');
+      req.resolve('@react-native/dev-middleware');
     } catch {
-      // Package not installed in this project — nothing to patch.
       return;
     }
 
-    const devMiddleware = req(devMiddlewarePath) as Record<string, unknown>;
-    const original = devMiddleware.createDevMiddleware;
+    // Load the main module so its dependency tree populates require.cache.
+    try { req('@react-native/dev-middleware'); } catch {}
 
-    if (typeof original !== 'function') {
-      logger.warn(
-        'Could not patch @react-native/dev-middleware: createDevMiddleware export not found. ' +
-          '"j" / "Open Debugger" will not route through the MCP proxy.',
-      );
-      return;
+    // ── Strategy 1: Prototype patch ──────────────────────────────────────
+    // Patching InspectorProxy.prototype.getPageDescriptions is the most
+    // reliable approach because it affects ALL instances — even ones
+    // created after the CLI destructured `createDevMiddleware` at import
+    // time (which makes the module-export patch ineffective).
+    let protoPatched = false;
+
+    // Try known internal paths where InspectorProxy lives.
+    const internalPaths = [
+      '@react-native/dev-middleware/dist/inspector-proxy/InspectorProxy',
+      '@react-native/dev-middleware/dist/inspector-proxy/InspectorProxy.js',
+    ];
+
+    for (const modPath of internalPaths) {
+      try {
+        const mod = req(modPath) as Record<string, unknown>;
+        const cls = (mod?.default || mod?.InspectorProxy || mod) as
+          (Record<string, unknown> & { prototype?: Record<string | symbol, unknown> }) | undefined;
+        if (typeof cls === 'function' && cls.prototype && typeof cls.prototype.getPageDescriptions === 'function') {
+          protoPatched = wrapGetPageDescriptions(cls.prototype);
+          if (protoPatched) break;
+        }
+      } catch {}
     }
 
-    devMiddleware.createDevMiddleware = function (
-      ...args: unknown[]
-    ): Record<string, unknown> {
-      const result = (original as (...a: unknown[]) => Record<string, unknown>).apply(
-        this,
-        args,
-      );
-
-      const proxy = result?.inspectorProxy as Record<string, unknown> | undefined;
-      if (!proxy || typeof proxy.getPageDescriptions !== 'function') {
-        return result;
+    // Fallback: search require.cache for any module whose export looks
+    // like the InspectorProxy class.
+    if (!protoPatched) {
+      const cache = require.cache ?? {};
+      for (const key of Object.keys(cache)) {
+        if (!key.includes('InspectorProxy')) continue;
+        const mod = cache[key];
+        const exp = (mod?.exports as Record<string, unknown>)?.default ?? mod?.exports;
+        if (typeof exp === 'function') {
+          const cls = exp as Record<string, unknown> & { prototype?: Record<string | symbol, unknown> };
+          if (cls.prototype && typeof cls.prototype.getPageDescriptions === 'function') {
+            protoPatched = wrapGetPageDescriptions(cls.prototype);
+            if (protoPatched) break;
+          }
+        }
       }
+    }
 
-      const originalGet = proxy.getPageDescriptions.bind(proxy) as (
-        ...a: unknown[]
-      ) => Record<string, unknown>[];
+    // ── Strategy 2: Module._load hook ────────────────────────────────────
+    // If InspectorProxy hasn't been loaded yet (lazy loaded inside
+    // createDevMiddleware), install a require hook to catch it.
+    if (!protoPatched) {
+      try {
+        // eslint-disable-next-line @typescript-eslint/no-require-imports
+        const Module = require('module') as Record<string, unknown>;
+        const originalLoad = Module._load as Function;
 
-      proxy.getPageDescriptions = function (...a: unknown[]): Record<string, unknown>[] {
-        const pages = originalGet(...a);
-        const proxyPort = discoverProxyPort();
-        if (!proxyPort) return pages;
-        return pages.map((page) => rewritePageDescription(page, proxyPort));
-      };
+        Module._load = function (request: string, ...rest: unknown[]) {
+          const result = originalLoad.call(this, request, ...rest);
+          if (
+            typeof request === 'string' &&
+            request.includes('InspectorProxy') &&
+            typeof result === 'function'
+          ) {
+            const cls = result as Record<string, unknown> & { prototype?: Record<string | symbol, unknown> };
+            if (cls.prototype && typeof cls.prototype.getPageDescriptions === 'function') {
+              if (wrapGetPageDescriptions(cls.prototype)) {
+                // Restore the original _load — we only need to patch once.
+                Module._load = originalLoad;
+              }
+            }
+          }
+          return result;
+        };
+      } catch {}
+    }
 
-      return result;
-    };
+    // ── Strategy 3: Wrap createDevMiddleware export ──────────────────────
+    // Belt-and-suspenders: also patch the returned inspectorProxy instance
+    // directly. This handles class-field methods (not on prototype) and
+    // cases where the module hasn't been imported by the CLI yet.
+    try {
+      const devMiddleware = req('@react-native/dev-middleware') as Record<string, unknown>;
+      const original = devMiddleware.createDevMiddleware;
+
+      if (typeof original === 'function') {
+        devMiddleware.createDevMiddleware = function (
+          ...args: unknown[]
+        ): Record<string, unknown> {
+          const result = (original as Function).apply(this, args) as Record<string, unknown>;
+          const proxy = result?.inspectorProxy as Record<string | symbol, unknown> | undefined;
+          if (proxy && typeof proxy.getPageDescriptions === 'function') {
+            wrapGetPageDescriptions(proxy);
+          }
+          return result;
+        };
+      }
+    } catch {}
   } catch (err) {
     logger.warn(
       'Unexpected error patching @react-native/dev-middleware:',
@@ -154,12 +237,6 @@ interface MetroConfig {
 /**
  * Wrap a Metro config to make pressing "j" and "Open Debugger" work
  * alongside the MCP server.
- *
- * Patches `@react-native/dev-middleware` so the InspectorProxy serves
- * the MCP's CDP proxy URL instead of the raw Hermes WebSocket URL.
- * This affects all CDP target consumers: the `/json` discovery endpoint,
- * the `/open-debugger` handler, and any future endpoint that queries
- * `inspectorProxy.getPageDescriptions()`.
  *
  * @example
  * ```js
