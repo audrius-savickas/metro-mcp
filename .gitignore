@@ -3,5 +3,6 @@ dist/
 *.tsbuildinfo
 .env
 .claude
+.metro-mcp-proxy-port
 docs/.vitepress/dist
 docs/.vitepress/cache

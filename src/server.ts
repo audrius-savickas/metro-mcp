@@ -1,4 +1,5 @@
 import { exec } from 'child_process';
+import { writeFileSync, unlinkSync } from 'fs';
 import { promisify } from 'util';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
@@ -381,6 +382,10 @@ export async function startServer(config: Required<MetroMCPConfig>): Promise<voi
         port: proxyPort,
         url: devtoolsUrl,
       };
+
+      // Write the port file so the optional Metro middleware can discover it.
+      process.env.METRO_MCP_PROXY_PORT = String(proxyPort);
+      try { writeFileSync('.metro-mcp-proxy-port', String(proxyPort)); } catch {}
     } catch (err) {
       logger.warn('Could not start CDP proxy:', err);
     }
@@ -392,8 +397,13 @@ export async function startServer(config: Required<MetroMCPConfig>): Promise<voi
   logger.info('MCP server started');
 
   // Clean up on shutdown
-  process.on('SIGINT', () => { cdpProxy?.stop(); process.exit(0); });
-  process.on('SIGTERM', () => { cdpProxy?.stop(); process.exit(0); });
+  function cleanup() {
+    cdpProxy?.stop();
+    try { unlinkSync('.metro-mcp-proxy-port'); } catch {}
+    process.exit(0);
+  }
+  process.on('SIGINT', cleanup);
+  process.on('SIGTERM', cleanup);
 
   // Try connecting to Metro (non-blocking — server works without connection)
   void connectToMetro();
