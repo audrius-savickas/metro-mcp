@@ -21,28 +21,37 @@
 
 import { readFileSync } from 'fs';
 import { createRequire } from 'module';
+import { createLogger } from '../utils/logger.js';
+
+const logger = createLogger('metro-config');
 
 const PROXY_PORT_ENV = 'METRO_MCP_PROXY_PORT';
 const PROXY_PORT_FILE = '.metro-mcp-proxy-port';
 
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
-type AnyRecord = Record<string, any>;
+// Cache the port after the first successful discovery — it's invariant once
+// the MCP server writes it. Never cache null: the MCP server may start after
+// Metro, so we keep retrying until we find a valid port.
+let cachedProxyPort: number | undefined;
 
-/**
- * Discover the proxy port on each call. Never caches null so we keep
- * retrying — Metro may start before the MCP server writes the port file.
- */
 function discoverProxyPort(): number | null {
+  if (cachedProxyPort !== undefined) return cachedProxyPort;
+
   const envPort = process.env[PROXY_PORT_ENV];
   if (envPort) {
     const port = parseInt(envPort, 10);
-    if (!isNaN(port) && port > 0) return port;
+    if (!isNaN(port) && port > 0) {
+      cachedProxyPort = port;
+      return port;
+    }
   }
 
   try {
     const content = readFileSync(PROXY_PORT_FILE, 'utf8').trim();
     const port = parseInt(content, 10);
-    if (!isNaN(port) && port > 0) return port;
+    if (!isNaN(port) && port > 0) {
+      cachedProxyPort = port;
+      return port;
+    }
   } catch {
     // File not present — MCP server not running yet.
   }
@@ -50,18 +59,17 @@ function discoverProxyPort(): number | null {
   return null;
 }
 
-/**
- * Rewrite `webSocketDebuggerUrl` and `devtoolsFrontendUrl` in a single
- * page-description object to point at the MCP CDP proxy.
- */
-function rewritePageDescription(page: AnyRecord, proxyPort: number): AnyRecord {
+function rewritePageDescription(
+  page: Record<string, unknown>,
+  proxyPort: number,
+): Record<string, unknown> {
   const rewritten = { ...page };
 
-  if (rewritten.webSocketDebuggerUrl) {
+  if (typeof rewritten.webSocketDebuggerUrl === 'string') {
     rewritten.webSocketDebuggerUrl = `ws://127.0.0.1:${proxyPort}`;
   }
 
-  if (rewritten.devtoolsFrontendUrl) {
+  if (typeof rewritten.devtoolsFrontendUrl === 'string') {
     // Replace the ws= (or wss=) query parameter value with the proxy address.
     // The URL looks like:
     //   http://localhost:8081/debugger-frontend/rn_fusebox.html?ws=localhost:8081/...
@@ -74,23 +82,15 @@ function rewritePageDescription(page: AnyRecord, proxyPort: number): AnyRecord {
   return rewritten;
 }
 
-/** True once the patch has been applied — prevents double-patching. */
 let patched = false;
 
-/**
- * Monkey-patch `@react-native/dev-middleware` so the InspectorProxy's
- * `getPageDescriptions()` rewrites CDP target URLs to point at the MCP proxy.
- *
- * This must be called before Metro starts (i.e. when metro.config.js loads).
- * The patch is idempotent — safe to call multiple times.
- */
 function patchDevMiddleware(): void {
   if (patched) return;
   patched = true;
 
   try {
-    // Resolve the module from the user's project root so we find the copy
-    // of @react-native/dev-middleware that Metro is actually using.
+    // Resolve from the user's project root so we find the copy of
+    // @react-native/dev-middleware that Metro is actually using.
     const req = createRequire(process.cwd() + '/');
 
     let devMiddlewarePath: string;
@@ -101,35 +101,36 @@ function patchDevMiddleware(): void {
       return;
     }
 
-    // eslint-disable-next-line @typescript-eslint/no-var-requires
-    const devMiddleware = req(devMiddlewarePath) as AnyRecord;
-
-    const original: ((...args: unknown[]) => AnyRecord) | undefined =
-      devMiddleware.createDevMiddleware;
+    const devMiddleware = req(devMiddlewarePath) as Record<string, unknown>;
+    const original = devMiddleware.createDevMiddleware;
 
     if (typeof original !== 'function') {
-      // API changed — bail out gracefully.
-      console.warn(
-        '[metro-mcp] Could not patch @react-native/dev-middleware: ' +
-          'createDevMiddleware export not found. ' +
+      logger.warn(
+        'Could not patch @react-native/dev-middleware: createDevMiddleware export not found. ' +
           '"j" / "Open Debugger" will not route through the MCP proxy.',
       );
       return;
     }
 
-    devMiddleware.createDevMiddleware = function (...args: unknown[]): AnyRecord {
-      const result: AnyRecord = original.apply(this, args);
+    devMiddleware.createDevMiddleware = function (
+      ...args: unknown[]
+    ): Record<string, unknown> {
+      const result = (original as (...a: unknown[]) => Record<string, unknown>).apply(
+        this,
+        args,
+      );
 
-      const proxy: AnyRecord | undefined = result?.inspectorProxy;
+      const proxy = result?.inspectorProxy as Record<string, unknown> | undefined;
       if (!proxy || typeof proxy.getPageDescriptions !== 'function') {
-        // Proxy not exposed or API changed — return result unchanged.
         return result;
       }
 
-      const originalGet: (...a: unknown[]) => AnyRecord[] = proxy.getPageDescriptions.bind(proxy);
+      const originalGet = proxy.getPageDescriptions.bind(proxy) as (
+        ...a: unknown[]
+      ) => Record<string, unknown>[];
 
-      proxy.getPageDescriptions = function (...a: unknown[]): AnyRecord[] {
-        const pages: AnyRecord[] = originalGet(...a);
+      proxy.getPageDescriptions = function (...a: unknown[]): Record<string, unknown>[] {
+        const pages = originalGet(...a);
         const proxyPort = discoverProxyPort();
         if (!proxyPort) return pages;
         return pages.map((page) => rewritePageDescription(page, proxyPort));
@@ -138,8 +139,8 @@ function patchDevMiddleware(): void {
       return result;
     };
   } catch (err) {
-    console.warn(
-      '[metro-mcp] Unexpected error patching @react-native/dev-middleware:',
+    logger.warn(
+      'Unexpected error patching @react-native/dev-middleware:',
       err,
       '\n"j" / "Open Debugger" will not route through the MCP proxy.',
     );
