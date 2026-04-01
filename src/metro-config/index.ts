@@ -144,10 +144,9 @@ function patchDevMiddleware(): void {
     for (const modPath of internalPaths) {
       try {
         const mod = req(modPath) as Record<string, unknown>;
-        const cls = (mod?.default || mod?.InspectorProxy || mod) as
-          (Record<string, unknown> & { prototype?: Record<string | symbol, unknown> }) | undefined;
-        if (typeof cls === 'function' && cls.prototype && typeof cls.prototype.getPageDescriptions === 'function') {
-          protoPatched = wrapGetPageDescriptions(cls.prototype);
+        const cls = mod?.default || mod?.InspectorProxy || mod;
+        if (typeof cls === 'function' && cls.prototype && typeof (cls.prototype as Record<string | symbol, unknown>).getPageDescriptions === 'function') {
+          protoPatched = wrapGetPageDescriptions(cls.prototype as Record<string | symbol, unknown>);
           if (protoPatched) break;
         }
       } catch {}
